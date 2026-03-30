@@ -1,0 +1,12 @@
+{
+  "name": "sky-climber-server",
+  "version": "1.0.0",
+  "description": "Sky Climber multiplayer server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
