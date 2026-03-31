@@ -97,13 +97,15 @@ function startGame(room) {
   room.state = 'playing';
   // 60fps 서버 틱
   let lastT = Date.now();
+  room.sendCounter = 0;
   room.tickId = setInterval(() => {
     const now = Date.now();
     const rawDt = (now - lastT) / 16.67;
     const dt = Math.min(rawDt, 3);
     lastT = now;
     tick(room, dt);
-    sendState(room);
+    room.sendCounter++;
+    if (room.sendCounter >= 3) { room.sendCounter = 0; sendState(room); }
   }, 16);
 }
 
