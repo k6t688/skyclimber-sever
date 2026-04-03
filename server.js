@@ -77,13 +77,16 @@ function makePlayer(charId, x, facing) {
 // ─── 게임 시작 ───────────────────────────────
 function startGame(room) {
   if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-
   const seed = parseInt(room.code) || 1234;
+  // null 제거한 실제 플레이어 목록
+  const activePlayers = room.game_players.filter(p => p !== null);
   const g = {
     camY: 0, scrollSpeed: 1.0, time: 0, seed, platIdx: 0,
     height: 0, ship: null, shipSpawned: false,
     platforms: [], projectiles: [],
-    p: [room.game_players[0], room.game_players[1]],
+    p: room.game_players, // 인덱스 보존 (null 포함)
+    activePlayers,        // null 제외 실제 플레이어
+    playerCount: activePlayers.length,
     state: 'countdown', countdown: 180, winner: -1,
   };
   g.platforms.push({ x: 0, worldY: 0, w: W, h: 20, type: 'ground', isShipPad: false });
@@ -113,14 +116,125 @@ function tick(room, dt) {
   g.time += dt;
   if (g.state === 'countdown') { g.countdown -= dt; if (g.countdown <= 0) g.state = 'playing'; return; }
 
-  // 스크롤 (우주선 스폰 후 정지)
+  // 스크롤
   if (!g.shipSpawned) {
     g.scrollSpeed = Math.min(3.0, 1.0 + g.time * 0.0004);
     g.camY -= g.scrollSpeed * dt;
     g.height += g.scrollSpeed * dt * 0.35;
-  } else {
-    g.scrollSpeed = 0;
+  } else { g.scrollSpeed = 0; }
+
+  // 우주선 스폰 (10000m)
+  if (g.height >= 10000 && !g.shipSpawned) {
+    g.shipSpawned = true;
+    const shipX = 200 + Math.random() * (W - 400);
+    const landWY = g.camY + H * 0.28;
+    const topPlat = Math.min(...g.platforms.map(p => p.worldY));
+    let stepY = topPlat;
+    while (stepY > landWY + 80) {
+      stepY -= 55 + Math.random() * 30;
+      const pw = 80 + Math.random() * 60;
+      g.platforms.push({ x: Math.random() * (W - pw), worldY: stepY, w: pw, h: 14, type: 'rock', isShipPad: false });
+    }
+    g.platforms.push({ x: shipX - 140, worldY: landWY, w: 280, h: 20, type: 'star', isShipPad: true });
+    g.platforms.push({ x: shipX - 250, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
+    g.platforms.push({ x: shipX + 150, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
+    g.ship = { x: shipX, w: 80, h: 100, worldY: g.camY - 120, targetWY: landWY,
+      phase: 'countdown', countdownTimer: 0, boarded: -1, boardTimer: 0, launching: false, launchVy: 0, padY: landWY };
   }
+
+  // 우주선 페이즈
+  if (g.ship) {
+    const s = g.ship;
+    if (s.phase === 'countdown') {
+      s.countdownTimer += dt; if (s.countdownTimer >= 300) s.phase = 'descending';
+    } else if (s.phase === 'descending') {
+      s.worldY += 3.5 * dt; if (s.worldY >= s.targetWY) { s.worldY = s.targetWY; s.phase = 'ready'; }
+    } else if (s.phase === 'ready') {
+      for (let i = 0; i < g.p.length; i++) {
+        const p = g.p[i]; if (!p || p.hp <= 0) continue;
+        if (Math.abs(p.x + p.w / 2 - s.x) < 50 && Math.abs(p.worldY + p.h / 2 - s.worldY - s.h / 2) < 70 && p.onGround) {
+          s.boarded = i; s.phase = 'boarded'; s.boardTimer = 0; p.vx = 0; p.vy = 0; break;
+        }
+      }
+    } else if (s.phase === 'boarded') {
+      const bp = g.p[s.boarded];
+      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20; bp.vx = 0; bp.vy = 0;
+      s.boardTimer += dt; if (s.boardTimer >= 300) { s.phase = 'launching'; s.launchVy = 0; }
+    } else if (s.phase === 'launching') {
+      const bp = g.p[s.boarded];
+      s.launchVy -= 0.15 * dt; s.worldY += s.launchVy * dt;
+      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20;
+      if (s.worldY - g.camY < -200) {
+        g.state = 'ended'; g.winner = s.boarded;
+        if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
+        room.state = 'ended'; sendState(room);
+      }
+    }
+  }
+
+  // 플레이어 업데이트
+  for (let i = 0; i < g.p.length; i++) {
+    const p = g.p[i]; if (!p) continue;
+    if (g.ship && (g.ship.phase === 'boarded' || g.ship.phase === 'launching') && g.ship.boarded === i) continue;
+    updatePlayer(g, p, dt);
+  }
+
+  // 겹침 방지 (4인)
+  for (let i = 0; i < g.p.length; i++) {
+    const p = g.p[i]; if (!p || p.stunTimer > 0) continue;
+    for (let j = 0; j < g.p.length; j++) {
+      if (i === j) continue;
+      const op = g.p[j]; if (!op || op.hp <= 0) continue;
+      const dx = (p.x + p.w / 2) - (op.x + op.w / 2);
+      const dy = (p.worldY + p.h / 2) - (op.worldY + op.h / 2);
+      const minDist = p.w * 0.9;
+      if (Math.abs(dx) < minDist && Math.abs(dy) < p.h * 0.8) {
+        const push = (minDist - Math.abs(dx)) * 0.15;
+        p.x += dx > 0 ? push : -push;
+      }
+    }
+  }
+
+  // 공격 판정 (4인 모든 조합)
+  for (let i = 0; i < g.p.length; i++) {
+    for (let j = 0; j < g.p.length; j++) {
+      if (i === j) continue;
+      const pi = g.p[i]; const pj = g.p[j]; if (!pi || !pj) continue;
+      checkHit(g, pi, pj);
+    }
+  }
+
+  // 낙사 체크
+  for (let i = 0; i < g.p.length; i++) {
+    const p = g.p[i]; if (!p) continue;
+    if (p.worldY - g.camY > H + 50) {
+      p.hp--;
+      if (p.hp <= 0) {
+        const alive = g.p.filter(pl => pl && pl.hp > 0);
+        if (alive.length <= 1) {
+          g.state = 'ended'; g.winner = alive.length === 1 ? g.p.indexOf(alive[0]) : -1;
+          if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
+          room.state = 'ended'; sendState(room); return;
+        }
+      } else respawn(g, p);
+    }
+  }
+
+  // 발판 생성
+  if (!g.shipSpawned) {
+    let topWY = Math.min(...g.platforms.map(p => p.worldY));
+    while (topWY > g.camY - H * 1.5) {
+      g.platIdx++;
+      const r1 = btlHash(g.seed, g.platIdx * 3), r2 = btlHash(g.seed, g.platIdx * 3 + 1), r3 = btlHash(g.seed, g.platIdx * 3 + 2);
+      topWY -= 70 + r1 * 50; const pw = 70 + r2 * 80;
+      g.platforms.push({ x: r3 * (W - pw), worldY: topWY, w: pw, h: 14, type: 'rock', isShipPad: false });
+    }
+  }
+  g.platforms = g.platforms.filter(p => p.isShipPad || p.worldY - g.camY < H + 200);
+
+  updateProjectiles(g, dt);
+  for (const p of g.p) { if (p && p.slowTimer > 0) p.slowTimer -= dt; }
+}
 
   // 우주선 스폰 (10000m)
   if (g.height >= 10000 && !g.shipSpawned) {
@@ -148,92 +262,6 @@ function tick(room, dt) {
     };
   }
 
-  // 우주선 페이즈
-  if (g.ship) {
-    const s = g.ship;
-    if (s.phase === 'countdown') {
-      s.countdownTimer += dt;
-      if (s.countdownTimer >= 300) s.phase = 'descending';
-    } else if (s.phase === 'descending') {
-      s.worldY += 3.5 * dt;
-      if (s.worldY >= s.targetWY) { s.worldY = s.targetWY; s.phase = 'ready'; }
-    } else if (s.phase === 'ready') {
-      for (let i = 0; i < 2; i++) {
-        const p = g.p[i];
-        if (p.hp <= 0) continue;
-        if (Math.abs(p.x + p.w / 2 - s.x) < 50 && Math.abs(p.worldY + p.h / 2 - s.worldY - s.h / 2) < 70 && p.onGround) {
-          s.boarded = i; s.phase = 'boarded'; s.boardTimer = 0; p.vx = 0; p.vy = 0; break;
-        }
-      }
-    } else if (s.phase === 'boarded') {
-      const bp = g.p[s.boarded];
-      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20; bp.vx = 0; bp.vy = 0;
-      s.boardTimer += dt;
-      if (s.boardTimer >= 300) { s.phase = 'launching'; s.launchVy = 0; }
-    } else if (s.phase === 'launching') {
-      const bp = g.p[s.boarded];
-      s.launchVy -= 0.15 * dt; s.worldY += s.launchVy * dt;
-      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20;
-      if (s.worldY - g.camY < -200) {
-        g.state = 'ended'; g.winner = s.boarded;
-        if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-        room.state = 'ended';
-        sendState(room);
-      }
-    }
-  }
-
-  // 플레이어 업데이트 (탑승 중 스킵)
-  for (let i = 0; i < 2; i++) {
-    const s = g.ship;
-    if (s && (s.phase === 'boarded' || s.phase === 'launching') && s.boarded === i) continue;
-    updatePlayer(g, g.p[i], dt);
-  }
-
-  // 겹침 방지
-  const a = g.p[0], b = g.p[1];
-  const ox = (a.x + a.w / 2) - (b.x + b.w / 2);
-  const minDist = (a.w + b.w) / 2;
-  if (Math.abs(ox) < minDist) {
-    const push = (minDist - Math.abs(ox)) / 2 + 0.5;
-    if (ox >= 0) { a.x += push; b.x -= push; } else { a.x -= push; b.x += push; }
-    if (a.vx * ox < 0) a.vx *= -0.3;
-    if (b.vx * (-ox) < 0) b.vx *= -0.3;
-  }
-
-  // 공격 판정
-  for (let i = 0; i < 2; i++) { checkHit(g, g.p[i], g.p[1 - i]); }
-
-  // 낙사 체크
-  for (let i = 0; i < 2; i++) {
-    const p = g.p[i];
-    if (p.worldY - g.camY > H + 50) {
-      p.hp--;
-      if (p.hp <= 0) {
-        g.state = 'ended'; g.winner = 1 - i;
-        if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-        room.state = 'ended';
-        sendState(room);
-      } else respawn(g, p);
-    }
-  }
-
-  // 발판 생성
-  if (!g.shipSpawned) {
-    let topWY = Math.min(...g.platforms.map(p => p.worldY));
-    while (topWY > g.camY - H * 1.5) {
-      g.platIdx++;
-      const r1 = btlHash(g.seed, g.platIdx * 3), r2 = btlHash(g.seed, g.platIdx * 3 + 1), r3 = btlHash(g.seed, g.platIdx * 3 + 2);
-      topWY -= 70 + r1 * 50; const pw = 70 + r2 * 80;
-      g.platforms.push({ x: r3 * (W - pw), worldY: topWY, w: pw, h: 14, type: 'rock', isShipPad: false });
-    }
-  }
-  g.platforms = g.platforms.filter(p => p.isShipPad || p.worldY - g.camY < H + 200);
-
-  updateProjectiles(g, dt);
-  for (const p of g.p) { if (p.slowTimer > 0) p.slowTimer -= dt; }
-}
-
 // ─── 플레이어 물리 ───────────────────────────
 function updatePlayer(g, p, dt) {
   const inp = p.input;
@@ -252,8 +280,12 @@ function updatePlayer(g, p, dt) {
     for (const pl of g.platforms) {
       if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
       const pBot = p.worldY + p.h;
-      if (pBot >= pl.worldY && pBot - p.vy * dt <= pl.worldY + 2 && p.vy > 0) {
+      const pBotPrev = pBot - p.vy * dt;
+      if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
         p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
+        // 버그3 수정: 기절 중 착지해도 knocked 해제 + 점프 회복
+        if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
+        p.jumps = p.maxJumps;
       }
     }
     return;
@@ -307,7 +339,8 @@ function updatePlayer(g, p, dt) {
   for (const pl of g.platforms) {
     if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
     const pBot = p.worldY + p.h;
-    if (pBot >= pl.worldY && pBot - p.vy * dt <= pl.worldY + 2 && p.vy > 0) {
+    const pBotPrev = pBot - p.vy * dt;
+    if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
       p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
       if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
       p.jumps = p.maxJumps;
@@ -392,8 +425,11 @@ function updateProjectiles(g, dt) {
           }
         }
         if (!pr.landed) {
-          const tgt = g.p[1 - pr.ownerIdx];
-          if (Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) { explode(g, pr); remove.push(i); continue; }
+          for (let ti = 0; ti < g.p.length; ti++) {
+            if (ti === pr.ownerIdx) continue;
+            const tgt = g.p[ti]; if (!tgt || tgt.hp <= 0) continue;
+            if (Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) { explode(g, pr); remove.push(i); break; }
+          }
         }
       }
       pr.fuse -= dt; if (pr.fuse <= 0) { explode(g, pr); remove.push(i); continue; }
@@ -401,30 +437,49 @@ function updateProjectiles(g, dt) {
     } else if (pr.type === 'shard') {
       pr.x += pr.vx * dt; pr.y += pr.vy * dt; pr.dist += Math.sqrt(pr.vx * pr.vx + pr.vy * pr.vy) * dt;
       if (pr.dist >= pr.maxDist) { remove.push(i); continue; }
-      const tgt = g.p[1 - pr.ownerIdx];
-      if (tgt.stunTimer <= 0 && Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) {
-        applyHit(tgt, Math.atan2(pr.vy, pr.vx), pr.kb, pr.stun);
-        tgt.slowTimer = pr.slowDur;
-        remove.push(i); continue;
+      let shardHit = false;
+      for (let ti = 0; ti < g.p.length; ti++) {
+        if (ti === pr.ownerIdx) continue;
+        const tgt = g.p[ti]; if (!tgt || tgt.hp <= 0 || tgt.stunTimer > 0) continue;
+        if (Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) {
+          applyHit(tgt, Math.atan2(pr.vy, pr.vx), pr.kb, pr.stun);
+          tgt.slowTimer = pr.slowDur;
+          shardHit = true; break;
+        }
       }
+      if (shardHit) { remove.push(i); continue; }
     }
   }
   for (let i = remove.length - 1; i >= 0; i--) g.projectiles.splice(remove[i], 1);
 
-  for (let i = 0; i < 2; i++) {
-    const p = g.p[i]; if (!p.grabArm) continue;
-    const arm = p.grabArm; const tgt = g.p[1 - i];
+  for (let i = 0; i < g.p.length; i++) {
+    const p = g.p[i]; if (!p || !p.grabArm) continue;
+    const arm = p.grabArm;
+    // 가장 가까운 적 탐색
+    let tgt = null, nearD = Infinity, tgtIdx = -1;
+    for (let j = 0; j < g.p.length; j++) {
+      if (j === i) continue;
+      const op = g.p[j]; if (!op || op.hp <= 0) continue;
+      const dx = op.x + op.w / 2 - arm.x, dy = op.worldY + op.h / 2 - arm.y;
+      const d = dx * dx + dy * dy;
+      if (d < nearD) { nearD = d; tgt = op; tgtIdx = j; }
+    }
+    if (!tgt) { p.grabArm = null; continue; }
     if (!arm.returning && !arm.hit) {
       arm.x += arm.vx * dt; arm.y += arm.vy * dt;
       arm.dist += Math.sqrt(arm.vx * arm.vx + arm.vy * arm.vy) * dt;
-      if (tgt.stunTimer <= 0 && Math.abs(arm.x - (tgt.x + tgt.w / 2)) < 20 && Math.abs(arm.y - (tgt.worldY + tgt.h / 2)) < 22) { arm.hit = true; arm.targetIdx = 1 - i; }
+      if (tgt.stunTimer <= 0 && Math.abs(arm.x - (tgt.x + tgt.w / 2)) < 20 && Math.abs(arm.y - (tgt.worldY + tgt.h / 2)) < 22) { arm.hit = true; arm.targetIdx = tgtIdx; }
       if (arm.dist >= arm.maxDist) arm.returning = true;
     } else if (arm.hit && arm.targetIdx >= 0) {
-      const t2 = g.p[arm.targetIdx];
+      const t2 = g.p[arm.targetIdx]; if (!t2) { p.grabArm = null; continue; }
       const px = p.x + p.w / 2, py = p.worldY + p.h / 2;
       const dx = px - t2.x - t2.w / 2, dy = py - t2.worldY - t2.h / 2;
       const d = Math.sqrt(dx * dx + dy * dy);
-      if (d < 20) { applyHit(t2, 0, 0, p.bs.stun); p.grabArm = null; continue; }
+      if (d < 20) {
+        const hitAngle = Math.atan2(t2.worldY + t2.h / 2 - py, t2.x + t2.w / 2 - px);
+        applyHit(t2, hitAngle, 3, p.bs.stun);
+        p.grabArm = null; continue;
+      }
       t2.vx = dx / d * 16; t2.vy = dy / d * 16;
       t2.x += t2.vx * dt; t2.worldY += t2.vy * dt;
       arm.x = t2.x + t2.w / 2; arm.y = t2.worldY + t2.h / 2;
@@ -438,9 +493,9 @@ function updateProjectiles(g, dt) {
 }
 
 function explode(g, pr) {
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < g.p.length; i++) {
     if (i === pr.ownerIdx) continue;
-    const p = g.p[i];
+    const p = g.p[i]; if (!p || p.hp <= 0) continue;
     const dx = p.x + p.w / 2 - pr.x, dy = p.worldY + p.h / 2 - pr.y;
     const d = Math.sqrt(dx * dx + dy * dy);
     if (d < pr.radius) { applyHit(p, Math.atan2(dy, dx), pr.kb * (1 - d / pr.radius * 0.5), pr.stun); }
@@ -458,6 +513,7 @@ function respawn(g, p) {
 
 // ─── 상태 전송 ───────────────────────────────
 function serializePlayer(p) {
+  if (!p) return null;
   return { x: p.x, wy: p.worldY, vx: p.vx, vy: p.vy, f: p.facing, fr: p.frame,
     atk: p.attacking, aa: p.attackAngle, at: p.attackTimer, og: p.onGround,
     st: p.stunTimer, hp: p.hp, mhp: p.maxHp, kn: p.knocked,
@@ -477,11 +533,11 @@ function sendState(room) {
     type: 'gs',
     s: g.state, t: g.time, cy: g.camY, h: g.height, ss: g.scrollSpeed,
     cd: g.countdown, w: g.winner,
-    p: [serializePlayer(g.p[0]), serializePlayer(g.p[1])],
+    p: g.p.map(pl => serializePlayer(pl)),
     pr: g.projectiles.map(p => ({ type: p.type, x: p.x, y: p.y, vx: p.vx || 0, vy: p.vy || 0, landed: p.landed, fuse: p.fuse, oi: p.ownerIdx, dist: p.dist })),
-    sh,
+    sh, playerCount: g.p.length,
   };
-  for (let i = 0; i < 2; i++) {
+  for (let i = 0; i < room.players.length; i++) {
     const ws = room.players[i];
     if (ws && ws.readyState === 1) {
       msg.idx = i;
@@ -517,33 +573,46 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'create_room': {
         const code = genRoomCode();
+        const max = Math.min(4, Math.max(2, parseInt(msg.maxPlayers) || 2));
         rooms.set(code, {
-          code, players: [ws, null], state: 'waiting',
+          code, players: Array(max).fill(null), state: 'waiting',
           createdAt: Date.now(), g: null, tickId: null,
-          game_players: [], chars: [null, null], skins: ['default', 'default'],
-          ready: [false, false],
+          maxPlayers: max,
+          game_players: [], chars: Array(max).fill(null), skins: Array(max).fill('default'),
+          ready: Array(max).fill(false),
         });
+        rooms.get(code).players[0] = ws;
         ws._roomCode = code; ws._playerIdx = 0;
-        sendTo(ws, { type: 'room_created', code });
+        sendTo(ws, { type: 'room_created', code, maxPlayers: max });
         break;
       }
       case 'join_room': {
         const code = String(msg.code);
         const room = rooms.get(code);
         if (!room) { sendTo(ws, { type: 'error', msg: '방을 찾을 수 없습니다' }); break; }
-        if (room.players[1] !== null && room.players[1].readyState === 1) { sendTo(ws, { type: 'error', msg: '방이 가득 찼습니다' }); break; }
-        const slot = room.players[0] === null ? 0 : 1;
+        // 빈 슬롯 찾기
+        const slot = room.players.findIndex(p => p === null || (p && p.readyState !== 1));
+        if (slot === -1) { sendTo(ws, { type: 'error', msg: '방이 가득 찼습니다' }); break; }
         room.players[slot] = ws; ws._roomCode = code; ws._playerIdx = slot;
-        sendTo(ws, { type: 'room_joined', code, playerIdx: slot });
-        const other = room.players[1 - slot];
-        if (other && other.readyState === 1) {
-          sendTo(other, { type: 'room_ready' });
-          sendTo(ws, { type: 'room_ready' });
-          if (room.chars[1 - slot]) sendTo(ws, { type: 'opponent_char', charId: room.chars[1 - slot], skinId: room.skins[1 - slot] });
-          if (room.chars[slot]) sendTo(other, { type: 'opponent_char', charId: room.chars[slot], skinId: room.skins[slot] });
-          if (room.ready[1 - slot]) sendTo(ws, { type: 'opponent_ready' });
-          if (room.ready[slot]) sendTo(other, { type: 'opponent_ready' });
+        sendTo(ws, { type: 'room_joined', code, playerIdx: slot, maxPlayers: room.maxPlayers });
+        // 현재 방 상태 전송 (기존 플레이어 캐릭터/준비 상태)
+        for (let i = 0; i < room.maxPlayers; i++) {
+          if (i === slot) continue;
+          if (room.chars[i]) sendTo(ws, { type: 'player_char', playerIdx: i, charId: room.chars[i], skinId: room.skins[i] });
+          if (room.ready[i]) sendTo(ws, { type: 'player_ready_state', playerIdx: i });
         }
+        // 기존 플레이어들에게 새 플레이어 입장 알림
+        for (let i = 0; i < room.maxPlayers; i++) {
+          if (i === slot) continue;
+          const other = room.players[i];
+          if (other && other.readyState === 1) {
+            sendTo(other, { type: 'room_ready' });
+            if (room.chars[slot]) sendTo(other, { type: 'player_char', playerIdx: slot, charId: room.chars[slot], skinId: room.skins[slot] });
+          }
+        }
+        // 방이 찼으면 모두에게 room_ready
+        const activePlayers = room.players.filter(p => p && p.readyState === 1).length;
+        if (activePlayers >= 2) sendTo(ws, { type: 'room_ready' });
         break;
       }
       case 'char_select': {
@@ -551,8 +620,12 @@ wss.on('connection', (ws) => {
         if (!room) break;
         room.chars[ws._playerIdx] = msg.charId;
         room.skins[ws._playerIdx] = msg.skinId || 'default';
-        const other = room.players[1 - ws._playerIdx];
-        sendTo(other, { type: 'opponent_char', charId: msg.charId, skinId: room.skins[ws._playerIdx] });
+        // 나 제외 모두에게 알림
+        for (let i = 0; i < room.maxPlayers; i++) {
+          if (i === ws._playerIdx) continue;
+          const other = room.players[i];
+          if (other && other.readyState === 1) sendTo(other, { type: 'player_char', playerIdx: ws._playerIdx, charId: msg.charId, skinId: room.skins[ws._playerIdx] });
+        }
         break;
       }
       case 'player_ready': {
@@ -561,15 +634,34 @@ wss.on('connection', (ws) => {
         room.chars[ws._playerIdx] = msg.charId;
         room.skins[ws._playerIdx] = msg.skinId || 'default';
         room.ready[ws._playerIdx] = true;
-        const other = room.players[1 - ws._playerIdx];
-        sendTo(other, { type: 'opponent_ready' });
-        if (room.ready[0] && room.ready[1] && room.chars[0] && room.chars[1]) {
-          room.ready = [false, false];
-          room.game_players = [
-            makePlayer(room.chars[0], W * 0.3, 1),
-            makePlayer(room.chars[1], W * 0.7, -1),
-          ];
-          broadcastAll(room, { type: 'game_start', chars: room.chars, skins: room.skins });
+        // 나 제외 모두에게 준비 알림
+        for (let i = 0; i < room.maxPlayers; i++) {
+          if (i === ws._playerIdx) continue;
+          const other = room.players[i];
+          if (other && other.readyState === 1) sendTo(other, { type: 'player_ready_state', playerIdx: ws._playerIdx });
+        }
+        // 현재 접속 중인 플레이어 수
+        const activePlayers = room.players.filter(p => p && p.readyState === 1);
+        const activeCount = activePlayers.length;
+        // 모두 준비됐는지 (접속 중인 플레이어만 체크, 최소 2명)
+        const allReady = activeCount >= 2 && activePlayers.every((p, i) => {
+          const idx = room.players.indexOf(p);
+          return room.ready[idx] && room.chars[idx];
+        });
+        if (allReady) {
+          room.ready = Array(room.maxPlayers).fill(false);
+          const spawnXs = [W * 0.2, W * 0.8, W * 0.4, W * 0.6];
+          const spawnFacings = [1, -1, 1, -1];
+          room.game_players = [];
+          for (let i = 0; i < room.maxPlayers; i++) {
+            if (room.players[i] && room.players[i].readyState === 1 && room.chars[i]) {
+              room.game_players[i] = makePlayer(room.chars[i], spawnXs[i], spawnFacings[i]);
+            } else {
+              room.game_players[i] = null;
+            }
+          }
+          room.activePlayerCount = activeCount;
+          broadcastAll(room, { type: 'game_start', chars: room.chars, skins: room.skins, playerCount: activeCount });
           startGame(room);
         }
         break;
