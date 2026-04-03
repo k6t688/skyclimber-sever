@@ -274,16 +274,17 @@ function updatePlayer(g, p, dt) {
     if (isCockroach && !p.onGround) p.vy = Math.min(p.vy + 0.35 * dt, 10);
     else p.vy = Math.min(p.vy + 0.55 * dt, 18);
     p.vx *= 0.95;
-    p.x += p.vx * dt; p.worldY += p.vy * dt;
+    p.x += p.vx * dt;
+    const prevWY = p.worldY;
+    p.worldY += p.vy * dt;
     if (p.x < -p.w) p.x = W; if (p.x > W) p.x = -p.w;
     p.onGround = false;
     for (const pl of g.platforms) {
       if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
       const pBot = p.worldY + p.h;
-      const pBotPrev = pBot - p.vy * dt;
+      const pBotPrev = prevWY + p.h;
       if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
         p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
-        // 버그3 수정: 기절 중 착지해도 knocked 해제 + 점프 회복
         if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
         p.jumps = p.maxJumps;
       }
@@ -332,14 +333,16 @@ function updatePlayer(g, p, dt) {
   if (isCockroach && !p.onGround && !p.flying) p.vy = Math.min(p.vy + 0.35 * dt, 10);
   else p.vy = Math.min(p.vy + 0.55 * dt, 18);
 
-  p.x += p.vx * dt; p.worldY += p.vy * dt;
+  p.x += p.vx * dt;
+  const prevWorldY = p.worldY;
+  p.worldY += p.vy * dt;
   if (p.x < -p.w) p.x = W; if (p.x > W) p.x = -p.w;
 
   p.onGround = false;
   for (const pl of g.platforms) {
     if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
     const pBot = p.worldY + p.h;
-    const pBotPrev = pBot - p.vy * dt;
+    const pBotPrev = prevWorldY + p.h;
     if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
       p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
       if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
@@ -475,13 +478,15 @@ function updateProjectiles(g, dt) {
       const px = p.x + p.w / 2, py = p.worldY + p.h / 2;
       const dx = px - t2.x - t2.w / 2, dy = py - t2.worldY - t2.h / 2;
       const d = Math.sqrt(dx * dx + dy * dy);
-      if (d < 20) {
+      if (d < 24) {
+        // 도착 - 인절미 반대 방향으로 넉백
         const hitAngle = Math.atan2(t2.worldY + t2.h / 2 - py, t2.x + t2.w / 2 - px);
         applyHit(t2, hitAngle, 3, p.bs.stun);
         p.grabArm = null; continue;
       }
+      // 끌어당기기: vx/vy 설정만 하고 위치는 updatePlayer에서 이동
+      // (중복 이동 방지를 위해 직접 이동 제거)
       t2.vx = dx / d * 16; t2.vy = dy / d * 16;
-      t2.x += t2.vx * dt; t2.worldY += t2.vy * dt;
       arm.x = t2.x + t2.w / 2; arm.y = t2.worldY + t2.h / 2;
     } else if (arm.returning) {
       const px = p.x + p.w / 2, py = p.worldY + p.h / 2;
