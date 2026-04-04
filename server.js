@@ -57,7 +57,6 @@ wss.on('connection', ws => {
       const p = myRoom.players.find(p=>p.idx===myIdx);
       if (p) { p.char = msg.char; p.skin = msg.skin; p.ready = false; }
       roomBroadcast(myRoom, { t:'char_update', idx:myIdx, char:msg.char, skin:msg.skin }, myIdx);
-      // 캐릭터 변경 시 준비 해제도 함께 전송
       roomBroadcast(myRoom, { t:'ready', idx:myIdx, ready:false }, myIdx);
     }
 
@@ -70,12 +69,10 @@ wss.on('connection', ws => {
 
     else if (msg.t === 'start' || msg.t === 'rematch') {
       if (!myRoom || myIdx !== 0 || myRoom.players.length < 2) return;
-      // 모든 플레이어가 준비 상태인지 확인
       const allReady = myRoom.players.every(p => p.ready);
       if (!allReady) return;
       const seed = Math.floor(Math.random() * 99999999);
       myRoom.state = 'playing';
-      // 준비 상태 초기화
       for (const p of myRoom.players) p.ready = false;
       roomBroadcast(myRoom, {
         t: 'game_start', seed,
