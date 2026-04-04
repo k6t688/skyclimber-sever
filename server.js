@@ -179,22 +179,6 @@ function tick(room, dt) {
     updatePlayer(g, p, dt);
   }
 
-  // 겹침 방지 (4인)
-  for (let i = 0; i < g.p.length; i++) {
-    const p = g.p[i]; if (!p || p.stunTimer > 0) continue;
-    for (let j = 0; j < g.p.length; j++) {
-      if (i === j) continue;
-      const op = g.p[j]; if (!op || op.hp <= 0) continue;
-      const dx = (p.x + p.w / 2) - (op.x + op.w / 2);
-      const dy = (p.worldY + p.h / 2) - (op.worldY + op.h / 2);
-      const minDist = p.w * 0.9;
-      if (Math.abs(dx) < minDist && Math.abs(dy) < p.h * 0.8) {
-        const push = (minDist - Math.abs(dx)) * 0.15;
-        p.x += dx > 0 ? push : -push;
-      }
-    }
-  }
-
   // 공격 판정 (4인 모든 조합)
   for (let i = 0; i < g.p.length; i++) {
     for (let j = 0; j < g.p.length; j++) {
@@ -354,6 +338,20 @@ function updatePlayer(g, p, dt) {
   else p.spinAngle = 0;
 
   if (Math.abs(p.vx) > 0.5) { p.ft += dt; if (p.ft > 7) { p.ft = 0; p.frame = (p.frame + 1) % 4; } } else p.frame = 0;
+
+  // 겹침 방지 (로컬과 동일 - 이동 직후 체크)
+  if (p.stunTimer <= 0) {
+    for (const op of g.p) {
+      if (!op || op === p || op.hp <= 0) continue;
+      const dx = (p.x + p.w / 2) - (op.x + op.w / 2);
+      const dy = (p.worldY + p.h / 2) - (op.worldY + op.h / 2);
+      const minDist = p.w * 0.9;
+      if (Math.abs(dx) < minDist && Math.abs(dy) < p.h * 0.8) {
+        const push = (minDist - Math.abs(dx)) * 0.15;
+        p.x += dx > 0 ? push : -push;
+      }
+    }
+  }
 }
 
 // ─── 공격 트리거 ─────────────────────────────
