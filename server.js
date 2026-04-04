@@ -57,6 +57,7 @@ wss.on('connection', ws => {
       const p = myRoom.players.find(p=>p.idx===myIdx);
       if (p) { p.char = msg.char; p.skin = msg.skin; p.ready = false; }
       roomBroadcast(myRoom, { t:'char_update', idx:myIdx, char:msg.char, skin:msg.skin }, myIdx);
+      // 캐릭터 변경 시 준비 해제도 함께 전송
       roomBroadcast(myRoom, { t:'ready', idx:myIdx, ready:false }, myIdx);
     }
 
@@ -67,7 +68,7 @@ wss.on('connection', ws => {
       roomBroadcast(myRoom, { t:'ready', idx:myIdx, ready:!!msg.ready });
     }
 
-    else if (msg.t === 'start' || msg.t === 'rematch') {
+    else if (msg.t === 'start') {
       if (!myRoom || myIdx !== 0 || myRoom.players.length < 2) return;
       const allReady = myRoom.players.every(p => p.ready);
       if (!allReady) return;
@@ -77,6 +78,16 @@ wss.on('connection', ws => {
       roomBroadcast(myRoom, {
         t: 'game_start', seed,
         players: myRoom.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin}))
+      });
+    }
+
+    else if (msg.t === 'return_lobby') {
+      if (!myRoom || myIdx !== 0) return;
+      myRoom.state = 'waiting';
+      for (const p of myRoom.players) p.ready = false;
+      roomBroadcast(myRoom, {
+        t: 'lobby_return',
+        players: myRoom.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin, ready:false}))
       });
     }
 
