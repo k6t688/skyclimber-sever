@@ -1,694 +1,99 @@
-const http = require('http');
-const { WebSocketServer } = require('ws');
-const PORT = process.env.PORT || 8080;
-const server = http.createServer((req, res) => { res.writeHead(200); res.end('Sky Climber Server OK'); });
-const wss = new WebSocketServer({ server });
+const WebSocket = require('ws');
+const wss = new WebSocket.Server({ port: 8080 });
 const rooms = new Map();
 
-// ─── 상수 ────────────────────────────────────
-const W = 900, H = 1200;
-const CHARS = {
-  human:          { jumpForce:-14, jumpCount:2, speed:5, friction:0.8, crouchTime:0, maxFlyTime:0, freezes:false },
-  mochi:          { jumpForce:-18, airJumpForce:-14, jumpCount:2, speed:5, friction:0.8, crouchTime:8, maxFlyTime:0, freezes:false },
-  cockroach:      { jumpForce:-10, jumpCount:1, speed:5, friction:0.8, crouchTime:0, maxFlyTime:60, freezes:false },
-  ice:            { jumpForce:-14, jumpCount:2, speed:5, friction:0.93, crouchTime:0, maxFlyTime:0, freezes:true },
-  rabbit:         { jumpForce:-12, jumpCount:3, speed:5, friction:0.8, crouchTime:0, maxFlyTime:0, freezes:false },
-  protein_stick:  { jumpForce:-24, jumpCount:1, speed:5, friction:0.8, crouchTime:10, maxFlyTime:0, freezes:false },
-};
-const BTL_STATS = {
-  human:         { hp:3, kb:20, stun:40, cooldown:22, atkType:'punch' },
-  mochi:         { hp:3, kb:0, stun:80, cooldown:50, atkType:'grab', grabRange:200, grabSpeed:18 },
-  cockroach:     { hp:4, kb:18, stun:60, cooldown:70, atkType:'bomb', bombSpeed:10, bombGravity:0.3, bombFuseTime:120, blastRadius:60 },
-  ice:           { hp:3, kb:12, stun:24, cooldown:30, atkType:'shard', shardSpeed:12, shardRange:150, slowDuration:180 },
-  rabbit:        { hp:3, kb:5, stun:8, cooldown:6, atkType:'rapidPunch', autoFire:true },
-  protein_stick: { hp:3, kb:8, stun:40, cooldown:30, atkType:'comboPunch', comboKbGrow:3, maxComboKb:30 },
-};
-
-function btlHash(seed, idx) {
-  let h = (seed * 2654435761 + idx * 2246822519) >>> 0;
-  h = ((h >> 16) ^ h) * 0x45d9f3b; h = ((h >> 16) ^ h) * 0x45d9f3b; h = (h >> 16) ^ h;
-  return (h & 0x7fffffff) / 0x7fffffff;
+function genCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code;
+  do { code = Array.from({length:4}, ()=>chars[Math.floor(Math.random()*chars.length)]).join(''); }
+  while (rooms.has(code));
+  return code;
 }
 
-// ─── 방/매칭 ──────────────────────────────────
-function genRoomCode() { let c; do { c = String(Math.floor(1000 + Math.random() * 9000)); } while (rooms.has(c)); return c; }
-
-function broadcastAll(room, msg) {
-  const d = JSON.stringify(msg);
-  for (const p of room.players) { if (p && p.readyState === 1) p.send(d); }
-}
-function sendTo(ws, msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
-
-// 빈 방 정리
-setInterval(() => {
-  for (const [code, room] of rooms) {
-    const alive = room.players.filter(p => p && p.readyState === 1);
-    if (alive.length === 0 || Date.now() - room.createdAt > 60 * 60 * 1000) {
-      if (room.tickId) clearInterval(room.tickId);
-      rooms.delete(code);
-    }
-  }
-}, 15000);
-
-// ─── 플레이어 생성 ───────────────────────────
-function makePlayer(charId, x, facing) {
-  const c = CHARS[charId]; const bs = BTL_STATS[charId];
-  let hitJumps = 1;
-  if (charId === 'rabbit') hitJumps = 2;
-  if (charId === 'cockroach') hitJumps = 0;
-  return {
-    x, worldY: -50, vx: 0, vy: 0, w: 22, h: 32, facing,
-    hp: bs.hp, maxHp: bs.hp, maxJumps: c.jumpCount, jumps: c.jumpCount,
-    jumpForce: c.jumpForce, airJumpForce: c.airJumpForce || c.jumpForce,
-    speed: c.speed, friction: c.friction,
-    onGround: false, frame: 0, ft: 0,
-    attacking: false, attackAngle: 0, attackTimer: 0, attackCooldown: 0,
-    crouching: false, crouchTimer: 0, crouchTime: c.crouchTime || 0,
-    flying: false, flyTimer: 0, maxFlyTime: c.maxFlyTime || 0,
-    spinAngle: 0, freezes: !!c.freezes,
-    stunTimer: 0, hitJumps, knocked: false,
-    slowTimer: 0, comboCount: 0,
-    grabArm: null, charId, bs,
-    input: { left: false, right: false, jump: false, attack: false, mouseX: 0, mouseY: 0 },
-    _jumpHeld: false, _attackHeld: false,
-  };
-}
-
-// ─── 게임 시작 ───────────────────────────────
-function startGame(room) {
-  if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-  const seed = parseInt(room.code) || 1234;
-  // null 제거한 실제 플레이어 목록
-  const activePlayers = room.game_players.filter(p => p !== null);
-  const g = {
-    camY: 0, scrollSpeed: 1.0, time: 0, seed, platIdx: 0,
-    height: 0, ship: null, shipSpawned: false,
-    platforms: [], projectiles: [],
-    p: room.game_players, // 인덱스 보존 (null 포함)
-    activePlayers,        // null 제외 실제 플레이어
-    playerCount: activePlayers.length,
-    state: 'countdown', countdown: 180, winner: -1,
-  };
-  g.platforms.push({ x: 0, worldY: 0, w: W, h: 20, type: 'ground', isShipPad: false });
-  let wy = -60;
-  while (wy > -H * 2) {
-    g.platIdx++;
-    const r1 = btlHash(seed, g.platIdx * 3), r2 = btlHash(seed, g.platIdx * 3 + 1), r3 = btlHash(seed, g.platIdx * 3 + 2);
-    wy -= 70 + r1 * 50; const pw = 70 + r2 * 80;
-    g.platforms.push({ x: r3 * (W - pw), worldY: wy, w: pw, h: 14, type: 'rock', isShipPad: false });
-  }
-  room.g = g;
-  room.state = 'playing';
-  let lastT = Date.now();
-  room.tickId = setInterval(() => {
-    const now = Date.now();
-    const dt = Math.min((now - lastT) / 16.667, 2.5);
-    lastT = now;
-    tick(room, dt);
-    sendState(room);
-  }, 16);
-}
-
-// ─── 메인 틱 ─────────────────────────────────
-function tick(room, dt) {
-  const g = room.g;
-  if (!g || g.state === 'ended') return;
-  g.time += dt;
-  if (g.state === 'countdown') { g.countdown -= dt; if (g.countdown <= 0) g.state = 'playing'; return; }
-
-  // 스크롤
-  if (!g.shipSpawned) {
-    g.scrollSpeed = Math.min(3.0, 1.0 + g.time * 0.0004);
-    g.camY -= g.scrollSpeed * dt;
-    g.height += g.scrollSpeed * dt * 0.35;
-  } else { g.scrollSpeed = 0; }
-
-  // 우주선 스폰 (10000m)
-  if (g.height >= 10000 && !g.shipSpawned) {
-    g.shipSpawned = true;
-    const shipX = 200 + Math.random() * (W - 400);
-    const landWY = g.camY + H * 0.28;
-    const topPlat = Math.min(...g.platforms.map(p => p.worldY));
-    let stepY = topPlat;
-    while (stepY > landWY + 80) {
-      stepY -= 55 + Math.random() * 30;
-      const pw = 80 + Math.random() * 60;
-      g.platforms.push({ x: Math.random() * (W - pw), worldY: stepY, w: pw, h: 14, type: 'rock', isShipPad: false });
-    }
-    g.platforms.push({ x: shipX - 140, worldY: landWY, w: 280, h: 20, type: 'star', isShipPad: true });
-    g.platforms.push({ x: shipX - 250, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
-    g.platforms.push({ x: shipX + 150, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
-    g.ship = { x: shipX, w: 80, h: 100, worldY: g.camY - 120, targetWY: landWY,
-      phase: 'countdown', countdownTimer: 0, boarded: -1, boardTimer: 0, launching: false, launchVy: 0, padY: landWY };
-  }
-
-  // 우주선 페이즈
-  if (g.ship) {
-    const s = g.ship;
-    if (s.phase === 'countdown') {
-      s.countdownTimer += dt; if (s.countdownTimer >= 300) s.phase = 'descending';
-    } else if (s.phase === 'descending') {
-      s.worldY += 3.5 * dt; if (s.worldY >= s.targetWY) { s.worldY = s.targetWY; s.phase = 'ready'; }
-    } else if (s.phase === 'ready') {
-      for (let i = 0; i < g.p.length; i++) {
-        const p = g.p[i]; if (!p || p.hp <= 0) continue;
-        if (Math.abs(p.x + p.w / 2 - s.x) < 50 && Math.abs(p.worldY + p.h / 2 - s.worldY - s.h / 2) < 70 && p.onGround) {
-          s.boarded = i; s.phase = 'boarded'; s.boardTimer = 0; p.vx = 0; p.vy = 0; break;
-        }
-      }
-    } else if (s.phase === 'boarded') {
-      const bp = g.p[s.boarded];
-      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20; bp.vx = 0; bp.vy = 0;
-      s.boardTimer += dt; if (s.boardTimer >= 300) { s.phase = 'launching'; s.launchVy = 0; }
-    } else if (s.phase === 'launching') {
-      const bp = g.p[s.boarded];
-      s.launchVy -= 0.15 * dt; s.worldY += s.launchVy * dt;
-      bp.x = s.x - bp.w / 2; bp.worldY = s.worldY + 20;
-      if (s.worldY - g.camY < -200) {
-        g.state = 'ended'; g.winner = s.boarded;
-        if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-        room.state = 'ended'; sendState(room);
-      }
-    }
-  }
-
-  // 플레이어 업데이트
-  for (let i = 0; i < g.p.length; i++) {
-    const p = g.p[i]; if (!p) continue;
-    if (g.ship && (g.ship.phase === 'boarded' || g.ship.phase === 'launching') && g.ship.boarded === i) continue;
-    updatePlayer(g, p, dt);
-  }
-
-  // 공격 판정 (4인 모든 조합)
-  for (let i = 0; i < g.p.length; i++) {
-    for (let j = 0; j < g.p.length; j++) {
-      if (i === j) continue;
-      const pi = g.p[i]; const pj = g.p[j]; if (!pi || !pj) continue;
-      checkHit(g, pi, pj);
-    }
-  }
-
-  // 낙사 체크
-  for (let i = 0; i < g.p.length; i++) {
-    const p = g.p[i]; if (!p) continue;
-    if (p.worldY - g.camY > H + 50) {
-      p.hp--;
-      if (p.hp <= 0) {
-        const alive = g.p.filter(pl => pl && pl.hp > 0);
-        if (alive.length <= 1) {
-          g.state = 'ended'; g.winner = alive.length === 1 ? g.p.indexOf(alive[0]) : -1;
-          if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-          room.state = 'ended'; sendState(room); return;
-        }
-      } else respawn(g, p);
-    }
-  }
-
-  // 발판 생성
-  if (!g.shipSpawned) {
-    let topWY = Math.min(...g.platforms.map(p => p.worldY));
-    while (topWY > g.camY - H * 1.5) {
-      g.platIdx++;
-      const r1 = btlHash(g.seed, g.platIdx * 3), r2 = btlHash(g.seed, g.platIdx * 3 + 1), r3 = btlHash(g.seed, g.platIdx * 3 + 2);
-      topWY -= 70 + r1 * 50; const pw = 70 + r2 * 80;
-      g.platforms.push({ x: r3 * (W - pw), worldY: topWY, w: pw, h: 14, type: 'rock', isShipPad: false });
-    }
-  }
-  g.platforms = g.platforms.filter(p => p.isShipPad || p.worldY - g.camY < H + 200);
-
-  updateProjectiles(g, dt);
-  for (const p of g.p) { if (p && p.slowTimer > 0) p.slowTimer -= dt; }
-}
-
-  // 우주선 스폰 (10000m)
-  if (g.height >= 10000 && !g.shipSpawned) {
-    g.shipSpawned = true;
-    const shipX = 200 + Math.random() * (W - 400);
-    const landWY = g.camY + H * 0.28;
-    const topPlat = Math.min(...g.platforms.map(p => p.worldY));
-    let stepY = topPlat;
-    while (stepY > landWY + 80) {
-      stepY -= 55 + Math.random() * 30;
-      const pw = 80 + Math.random() * 60;
-      g.platforms.push({ x: Math.random() * (W - pw), worldY: stepY, w: pw, h: 14, type: 'rock', isShipPad: false });
-    }
-    g.platforms.push({ x: shipX - 140, worldY: landWY, w: 280, h: 20, type: 'star', isShipPad: true });
-    g.platforms.push({ x: shipX - 250, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
-    g.platforms.push({ x: shipX + 150, worldY: landWY + 40, w: 100, h: 14, type: 'rock', isShipPad: false });
-    g.ship = {
-      x: shipX, w: 80, h: 100,
-      worldY: g.camY - 120,
-      targetWY: landWY,
-      phase: 'countdown', countdownTimer: 0,
-      boarded: -1, boardTimer: 0,
-      launching: false, launchVy: 0,
-      padY: landWY,
-    };
-  }
-
-// ─── 플레이어 물리 ───────────────────────────
-function updatePlayer(g, p, dt) {
-  const inp = p.input;
-  const isCockroach = p.charId === 'cockroach';
-  const hasCrouch = p.crouchTime > 0;
-  const spdMult = p.slowTimer > 0 ? 0.5 : 1;
-
-  if (p.stunTimer > 0) {
-    p.stunTimer -= dt;
-    if (isCockroach && !p.onGround) p.vy = Math.min(p.vy + 0.35 * dt, 10);
-    else p.vy = Math.min(p.vy + 0.55 * dt, 18);
-    p.vx *= 0.95;
-    p.x += p.vx * dt;
-    const prevWY = p.worldY;
-    p.worldY += p.vy * dt;
-    if (p.x < -p.w) p.x = W; if (p.x > W) p.x = -p.w;
-    p.onGround = false;
-    for (const pl of g.platforms) {
-      if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
-      const pBot = p.worldY + p.h;
-      const pBotPrev = prevWY + p.h;
-      if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
-        p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
-        if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
-        p.jumps = p.maxJumps;
-      }
-    }
-    return;
-  }
-
-  if (inp.left) { if (!p.crouching) { p.vx = -p.speed * spdMult; p.facing = -1; } }
-  else if (inp.right) { if (!p.crouching) { p.vx = p.speed * spdMult; p.facing = 1; } }
-  else p.vx *= p.friction;
-
-  if (hasCrouch && p.crouching) {
-    p.vx *= 0.5; p.crouchTimer += dt;
-    if (!p.onGround) p.crouching = false;
-    else if (p.crouchTimer >= p.crouchTime) { p.crouching = false; p.vy = p.jumpForce; p.jumps--; }
-  }
-
-  if (isCockroach) {
-    if (inp.jump && p.flyTimer < p.maxFlyTime) { p.vy = Math.max(p.vy - 1.0 * dt, -7); p.flyTimer += dt; p.flying = true; }
-    else p.flying = false;
-    if (p.onGround) { p.flyTimer = 0; p.flying = false; }
-  }
-
-  if (inp.jump && !p._jumpHeld) {
-    if (isCockroach) { /* 비행만 */ }
-    else if (hasCrouch) {
-      if (p.onGround && !p.crouching && !p.knocked) { p.crouching = true; p.crouchTimer = 0; p._jumpHeld = true; }
-      else if (!p.onGround && p.jumps > 0) { p.vy = p.airJumpForce; p.jumps--; p._jumpHeld = true; }
-      else if (p.onGround && p.knocked && p.jumps > 0) { p.vy = p.airJumpForce; p.jumps--; p._jumpHeld = true; }
-    } else {
-      if (p.jumps > 0) { p.vy = p.jumpForce; p.jumps--; p._jumpHeld = true; }
-    }
-  }
-  if (!inp.jump) p._jumpHeld = false;
-
-  if (p.attackCooldown > 0) p.attackCooldown -= dt;
-  if (p.attacking) { p.attackTimer -= dt; if (p.attackTimer <= 0) p.attacking = false; }
-  if (inp.attack && p.bs.autoFire && !p.attacking && p.attackCooldown <= 0 && p.stunTimer <= 0) {
-    triggerAttack(g, p);
-  }
-  if (inp.attack && !p._attackHeld && !p.bs.autoFire && p.stunTimer <= 0) {
-    triggerAttack(g, p); p._attackHeld = true;
-  }
-  if (!inp.attack) p._attackHeld = false;
-
-  if (isCockroach && !p.onGround && !p.flying) p.vy = Math.min(p.vy + 0.35 * dt, 10);
-  else p.vy = Math.min(p.vy + 0.55 * dt, 18);
-
-  p.x += p.vx * dt;
-  const prevWorldY = p.worldY;
-  p.worldY += p.vy * dt;
-  if (p.x < -p.w) p.x = W; if (p.x > W) p.x = -p.w;
-
-  p.onGround = false;
-  for (const pl of g.platforms) {
-    if (p.x + p.w <= pl.x || p.x >= pl.x + pl.w) continue;
-    const pBot = p.worldY + p.h;
-    const pBotPrev = prevWorldY + p.h;
-    if (pBotPrev <= pl.worldY + 2 && pBot >= pl.worldY && p.vy > 0) {
-      p.worldY = pl.worldY - p.h; p.vy = 0; p.onGround = true;
-      if (p.knocked) { p.knocked = false; p.flyTimer = 0; }
-      p.jumps = p.maxJumps;
-    }
-  }
-
-  if (p.charId === 'protein_stick' && !p.onGround) p.spinAngle += 0.25 * dt;
-  else p.spinAngle = 0;
-
-  if (Math.abs(p.vx) > 0.5) { p.ft += dt; if (p.ft > 7) { p.ft = 0; p.frame = (p.frame + 1) % 4; } } else p.frame = 0;
-
-  // 겹침 방지 (로컬과 동일 - 이동 직후 체크)
-  if (p.stunTimer <= 0) {
-    for (const op of g.p) {
-      if (!op || op === p || op.hp <= 0) continue;
-      const dx = (p.x + p.w / 2) - (op.x + op.w / 2);
-      const dy = (p.worldY + p.h / 2) - (op.worldY + op.h / 2);
-      const minDist = p.w * 0.9;
-      if (Math.abs(dx) < minDist && Math.abs(dy) < p.h * 0.8) {
-        const push = (minDist - Math.abs(dx)) * 0.15;
-        p.x += dx > 0 ? push : -push;
-      }
-    }
+function roomBroadcast(room, msg, excludeIdx=-1) {
+  const str = JSON.stringify(msg);
+  for (const p of room.players) {
+    if (p && p.idx !== excludeIdx && p.ws.readyState === WebSocket.OPEN)
+      p.ws.send(str);
   }
 }
 
-// ─── 공격 트리거 ─────────────────────────────
-function triggerAttack(g, p) {
-  const bs = p.bs;
-  const angle = Math.atan2(p.input.mouseY - (p.worldY + p.h / 2 - g.camY), p.input.mouseX - (p.x + p.w / 2));
-  p.facing = Math.cos(angle) >= 0 ? 1 : -1;
-  p.attackAngle = angle;
+wss.on('connection', ws => {
+  let myRoom = null;
+  let myIdx = -1;
 
-  if (bs.atkType === 'rapidPunch') {
-    if (p.attacking || p.attackCooldown > 0) return;
-    p.attacking = true; p.attackTimer = 8; p.attackCooldown = bs.cooldown;
-  } else if (bs.atkType === 'grab') {
-    if (p.attacking || p.attackCooldown > 0 || p.grabArm) return;
-    p.attackCooldown = bs.cooldown;
-    p.grabArm = { x: p.x + p.w / 2, y: p.worldY + p.h / 2, vx: Math.cos(angle) * bs.grabSpeed, vy: Math.sin(angle) * bs.grabSpeed, dist: 0, maxDist: bs.grabRange, hit: false, returning: false, targetIdx: -1 };
-  } else if (bs.atkType === 'bomb') {
-    if (p.attackCooldown > 0) return;
-    p.attackCooldown = bs.cooldown;
-    g.projectiles.push({ type: 'bomb', ownerIdx: g.p.indexOf(p), x: p.x + p.w / 2, y: p.worldY + p.h / 2, vx: Math.cos(angle) * bs.bombSpeed, vy: Math.sin(angle) * bs.bombSpeed, gravity: bs.bombGravity, fuse: bs.bombFuseTime, landed: false, radius: bs.blastRadius, stun: bs.stun, kb: bs.kb });
-  } else if (bs.atkType === 'shard') {
-    if (p.attackCooldown > 0) return;
-    p.attackCooldown = bs.cooldown;
-    g.projectiles.push({ type: 'shard', ownerIdx: g.p.indexOf(p), x: p.x + p.w / 2, y: p.worldY + p.h / 2, vx: Math.cos(angle) * bs.shardSpeed, vy: Math.sin(angle) * bs.shardSpeed, dist: 0, maxDist: bs.shardRange, stun: bs.stun, kb: bs.kb, slowDur: bs.slowDuration });
-  } else if (bs.atkType === 'comboPunch') {
-    if (p.attacking || p.attackCooldown > 0) return;
-    p.attacking = true; p.attackTimer = 10; p.attackCooldown = bs.cooldown;
-  } else {
-    if (p.attacking || p.attackCooldown > 0) return;
-    p.attacking = true; p.attackTimer = 12; p.attackCooldown = bs.cooldown;
-  }
-}
-
-// ─── 피격 판정 ───────────────────────────────
-function checkHit(g, atk, tgt) {
-  const bs = atk.bs;
-  if (bs.atkType !== 'punch' && bs.atkType !== 'rapidPunch' && bs.atkType !== 'comboPunch') return;
-  const maxT = bs.atkType === 'rapidPunch' ? 8 : bs.atkType === 'comboPunch' ? 10 : 12;
-  if (!atk.attacking || atk.attackTimer > maxT - 2 || atk.attackTimer < 1) return;
-  if (tgt.stunTimer > 0) return;
-  const cx = atk.x + atk.w / 2, cy = atk.worldY + atk.h / 2;
-  const fx = cx + Math.cos(atk.attackAngle) * 30, fy = cy + Math.sin(atk.attackAngle) * 30;
-  const dx = (tgt.x + tgt.w / 2) - fx, dy = (tgt.worldY + tgt.h / 2) - fy;
-  if (Math.sqrt(dx * dx + dy * dy) < 28) {
-    let kb = bs.kb;
-    if (bs.atkType === 'comboPunch') { atk.comboCount++; kb = Math.min(bs.maxComboKb, bs.kb + atk.comboCount * bs.comboKbGrow); }
-    applyHit(tgt, atk.attackAngle, kb, bs.stun);
-    atk.attacking = false;
-  }
-}
-
-function applyHit(tgt, angle, kb, stun) {
-  tgt.vx = Math.cos(angle) * kb; tgt.vy = Math.sin(angle) * kb;
-  tgt.stunTimer = stun; tgt.crouching = false; tgt.crouchTimer = 0; tgt.flying = false;
-  tgt.knocked = true;
-  if (tgt.charId === 'cockroach') { tgt.flyTimer = tgt.maxFlyTime * 0.5; tgt.jumps = 0; }
-  else if (tgt.charId === 'rabbit') tgt.jumps = 2;
-  else tgt.jumps = 1;
-}
-
-// ─── 투사체 ──────────────────────────────────
-function updateProjectiles(g, dt) {
-  const remove = [];
-  for (let i = 0; i < g.projectiles.length; i++) {
-    const pr = g.projectiles[i];
-    if (pr.type === 'bomb') {
-      if (!pr.landed) {
-        pr.vy += pr.gravity * dt; pr.x += pr.vx * dt; pr.y += pr.vy * dt;
-        for (const pl of g.platforms) {
-          if (pr.x > pl.x && pr.x < pl.x + pl.w && pr.y >= pl.worldY - 6 && pr.y <= pl.worldY + pl.h + 4) {
-            pr.landed = true; pr.vx = 0; pr.vy = 0; pr.y = pl.worldY - 6; if (pr.fuse > 120) pr.fuse = 120; break;
-          }
-        }
-        if (!pr.landed) {
-          for (let ti = 0; ti < g.p.length; ti++) {
-            if (ti === pr.ownerIdx) continue;
-            const tgt = g.p[ti]; if (!tgt || tgt.hp <= 0) continue;
-            if (Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) { explode(g, pr); remove.push(i); break; }
-          }
-        }
-      }
-      pr.fuse -= dt; if (pr.fuse <= 0) { explode(g, pr); remove.push(i); continue; }
-      if (pr.y - g.camY > H + 100) { remove.push(i); continue; }
-    } else if (pr.type === 'shard') {
-      pr.x += pr.vx * dt; pr.y += pr.vy * dt; pr.dist += Math.sqrt(pr.vx * pr.vx + pr.vy * pr.vy) * dt;
-      if (pr.dist >= pr.maxDist) { remove.push(i); continue; }
-      let shardHit = false;
-      for (let ti = 0; ti < g.p.length; ti++) {
-        if (ti === pr.ownerIdx) continue;
-        const tgt = g.p[ti]; if (!tgt || tgt.hp <= 0 || tgt.stunTimer > 0) continue;
-        if (Math.abs(pr.x - (tgt.x + tgt.w / 2)) < 18 && Math.abs(pr.y - (tgt.worldY + tgt.h / 2)) < 20) {
-          applyHit(tgt, Math.atan2(pr.vy, pr.vx), pr.kb, pr.stun);
-          tgt.slowTimer = pr.slowDur;
-          shardHit = true; break;
-        }
-      }
-      if (shardHit) { remove.push(i); continue; }
-    }
-  }
-  for (let i = remove.length - 1; i >= 0; i--) g.projectiles.splice(remove[i], 1);
-
-  for (let i = 0; i < g.p.length; i++) {
-    const p = g.p[i]; if (!p || !p.grabArm) continue;
-    const arm = p.grabArm;
-    // 가장 가까운 적 탐색
-    let tgt = null, nearD = Infinity, tgtIdx = -1;
-    for (let j = 0; j < g.p.length; j++) {
-      if (j === i) continue;
-      const op = g.p[j]; if (!op || op.hp <= 0) continue;
-      const dx = op.x + op.w / 2 - arm.x, dy = op.worldY + op.h / 2 - arm.y;
-      const d = dx * dx + dy * dy;
-      if (d < nearD) { nearD = d; tgt = op; tgtIdx = j; }
-    }
-    if (!tgt) { p.grabArm = null; continue; }
-    if (!arm.returning && !arm.hit) {
-      arm.x += arm.vx * dt; arm.y += arm.vy * dt;
-      arm.dist += Math.sqrt(arm.vx * arm.vx + arm.vy * arm.vy) * dt;
-      if (tgt.stunTimer <= 0 && Math.abs(arm.x - (tgt.x + tgt.w / 2)) < 20 && Math.abs(arm.y - (tgt.worldY + tgt.h / 2)) < 22) { arm.hit = true; arm.targetIdx = tgtIdx; }
-      if (arm.dist >= arm.maxDist) arm.returning = true;
-    } else if (arm.hit && arm.targetIdx >= 0) {
-      const t2 = g.p[arm.targetIdx]; if (!t2) { p.grabArm = null; continue; }
-      const px = p.x + p.w / 2, py = p.worldY + p.h / 2;
-      const dx = px - t2.x - t2.w / 2, dy = py - t2.worldY - t2.h / 2;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      if (d < 24) {
-        // 도착 - 인절미 반대 방향으로 넉백
-        const hitAngle = Math.atan2(t2.worldY + t2.h / 2 - py, t2.x + t2.w / 2 - px);
-        applyHit(t2, hitAngle, 3, p.bs.stun);
-        p.grabArm = null; continue;
-      }
-      // 끌어당기기: vx/vy 설정만 하고 위치는 updatePlayer에서 이동
-      // (중복 이동 방지를 위해 직접 이동 제거)
-      t2.vx = dx / d * 16; t2.vy = dy / d * 16;
-      arm.x = t2.x + t2.w / 2; arm.y = t2.worldY + t2.h / 2;
-    } else if (arm.returning) {
-      const px = p.x + p.w / 2, py = p.worldY + p.h / 2;
-      const dx = px - arm.x, dy = py - arm.y, d = Math.sqrt(dx * dx + dy * dy);
-      if (d < 15) { p.grabArm = null; continue; }
-      arm.x += dx / d * 18 * dt; arm.y += dy / d * 18 * dt;
-    }
-  }
-}
-
-function explode(g, pr) {
-  for (let i = 0; i < g.p.length; i++) {
-    if (i === pr.ownerIdx) continue;
-    const p = g.p[i]; if (!p || p.hp <= 0) continue;
-    const dx = p.x + p.w / 2 - pr.x, dy = p.worldY + p.h / 2 - pr.y;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d < pr.radius) { applyHit(p, Math.atan2(dy, dx), pr.kb * (1 - d / pr.radius * 0.5), pr.stun); }
-  }
-}
-
-function respawn(g, p) {
-  const vis = g.platforms.filter(pl => pl.worldY - g.camY > 30 && pl.worldY - g.camY < H * 0.35);
-  if (vis.length > 0) { const pl = vis[Math.floor(Math.random() * vis.length)]; p.x = pl.x + pl.w / 2 - p.w / 2; p.worldY = pl.worldY - p.h - 10; }
-  else { p.x = W / 2 - p.w / 2; p.worldY = g.camY + 60; }
-  p.vx = 0; p.vy = 0; p.jumps = p.maxJumps; p.crouching = false; p.crouchTimer = 0;
-  p.flying = false; p.flyTimer = 0; p.spinAngle = 0; p.stunTimer = 0; p.knocked = false;
-  p.slowTimer = 0; p.grabArm = null; p.attacking = false;
-}
-
-// ─── 상태 전송 ───────────────────────────────
-function serializePlayer(p) {
-  if (!p) return null;
-  return { x: p.x, wy: p.worldY, vx: p.vx, vy: p.vy, f: p.facing, fr: p.frame,
-    atk: p.attacking, aa: p.attackAngle, at: p.attackTimer, og: p.onGround,
-    st: p.stunTimer, hp: p.hp, mhp: p.maxHp, kn: p.knocked,
-    cr: p.crouching, ct: p.crouchTimer, fl: p.flying, ft: p.flyTimer,
-    sa: p.spinAngle, sl: p.slowTimer, cc: p.comboCount, cid: p.charId,
-    ga: p.grabArm ? { x: p.grabArm.x, y: p.grabArm.y, hit: p.grabArm.hit, ret: p.grabArm.returning } : null };
-}
-
-function sendState(room) {
-  const g = room.g; if (!g) return;
-  const sh = g.ship ? {
-    x: g.ship.x, wy: g.ship.worldY, b: g.ship.boarded, bt: g.ship.boardTimer,
-    l: g.ship.launching, py: g.ship.padY,
-    ph: g.ship.phase, ct: g.ship.countdownTimer,
-  } : null;
-  const msg = {
-    type: 'gs',
-    s: g.state, t: g.time, cy: g.camY, h: g.height, ss: g.scrollSpeed,
-    cd: g.countdown, w: g.winner,
-    p: g.p.map(pl => serializePlayer(pl)),
-    pr: g.projectiles.map(p => ({ type: p.type, x: p.x, y: p.y, vx: p.vx || 0, vy: p.vy || 0, landed: p.landed, fuse: p.fuse, oi: p.ownerIdx, dist: p.dist })),
-    sh, playerCount: g.p.length,
-  };
-  for (let i = 0; i < room.players.length; i++) {
-    const ws = room.players[i];
-    if (ws && ws.readyState === 1) {
-      msg.idx = i;
-      ws.send(JSON.stringify(msg));
-    }
-  }
-}
-
-// ─── 연결 처리 ───────────────────────────────
-function removePlayer(ws) {
-  if (!ws._roomCode) return;
-  const room = rooms.get(ws._roomCode);
-  if (!room) return;
-  const idx = room.players.indexOf(ws);
-  if (idx !== -1) room.players[idx] = null;
-  if (room.tickId) { clearInterval(room.tickId); room.tickId = null; }
-  const alive = room.players.filter(p => p !== null);
-  if (alive.length === 0) {
-    rooms.delete(ws._roomCode);
-  } else {
-    broadcastAll(room, { type: 'opponent_left' });
-    room.state = 'waiting';
-    room.g = null;
-  }
-}
-
-wss.on('connection', (ws) => {
-  ws._roomCode = null; ws._playerIdx = -1;
-
-  ws.on('message', (raw) => {
+  ws.on('message', raw => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
 
-    switch (msg.type) {
-      case 'create_room': {
-        const code = genRoomCode();
-        const max = Math.min(4, Math.max(2, parseInt(msg.maxPlayers) || 2));
-        rooms.set(code, {
-          code, players: Array(max).fill(null), state: 'waiting',
-          createdAt: Date.now(), g: null, tickId: null,
-          maxPlayers: max,
-          game_players: [], chars: Array(max).fill(null), skins: Array(max).fill('default'),
-          ready: Array(max).fill(false),
-        });
-        rooms.get(code).players[0] = ws;
-        ws._roomCode = code; ws._playerIdx = 0;
-        sendTo(ws, { type: 'room_created', code, maxPlayers: max });
-        break;
-      }
-      case 'join_room': {
-        const code = String(msg.code);
-        const room = rooms.get(code);
-        if (!room) { sendTo(ws, { type: 'error', msg: '방을 찾을 수 없습니다' }); break; }
-        // 빈 슬롯 찾기
-        const slot = room.players.findIndex(p => p === null || (p && p.readyState !== 1));
-        if (slot === -1) { sendTo(ws, { type: 'error', msg: '방이 가득 찼습니다' }); break; }
-        room.players[slot] = ws; ws._roomCode = code; ws._playerIdx = slot;
-        sendTo(ws, { type: 'room_joined', code, playerIdx: slot, maxPlayers: room.maxPlayers });
-        // 현재 방 상태 전송 (기존 플레이어 캐릭터/준비 상태)
-        for (let i = 0; i < room.maxPlayers; i++) {
-          if (i === slot) continue;
-          if (room.chars[i]) sendTo(ws, { type: 'player_char', playerIdx: i, charId: room.chars[i], skinId: room.skins[i] });
-          if (room.ready[i]) sendTo(ws, { type: 'player_ready_state', playerIdx: i });
-        }
-        // 기존 플레이어들에게 새 플레이어 입장 알림
-        for (let i = 0; i < room.maxPlayers; i++) {
-          if (i === slot) continue;
-          const other = room.players[i];
-          if (other && other.readyState === 1) {
-            sendTo(other, { type: 'room_ready' });
-            if (room.chars[slot]) sendTo(other, { type: 'player_char', playerIdx: slot, charId: room.chars[slot], skinId: room.skins[slot] });
-          }
-        }
-        // 방이 찼으면 모두에게 room_ready
-        const activePlayers = room.players.filter(p => p && p.readyState === 1).length;
-        if (activePlayers >= 2) sendTo(ws, { type: 'room_ready' });
-        break;
-      }
-      case 'char_select': {
-        const room = rooms.get(ws._roomCode);
-        if (!room) break;
-        room.chars[ws._playerIdx] = msg.charId;
-        room.skins[ws._playerIdx] = msg.skinId || 'default';
-        // 나 제외 모두에게 알림
-        for (let i = 0; i < room.maxPlayers; i++) {
-          if (i === ws._playerIdx) continue;
-          const other = room.players[i];
-          if (other && other.readyState === 1) sendTo(other, { type: 'player_char', playerIdx: ws._playerIdx, charId: msg.charId, skinId: room.skins[ws._playerIdx] });
-        }
-        break;
-      }
-      case 'player_ready': {
-        const room = rooms.get(ws._roomCode);
-        if (!room) break;
-        room.chars[ws._playerIdx] = msg.charId;
-        room.skins[ws._playerIdx] = msg.skinId || 'default';
-        room.ready[ws._playerIdx] = true;
-        // 나 제외 모두에게 준비 알림
-        for (let i = 0; i < room.maxPlayers; i++) {
-          if (i === ws._playerIdx) continue;
-          const other = room.players[i];
-          if (other && other.readyState === 1) sendTo(other, { type: 'player_ready_state', playerIdx: ws._playerIdx });
-        }
-        // 현재 접속 중인 플레이어 수
-        const activePlayers = room.players.filter(p => p && p.readyState === 1);
-        const activeCount = activePlayers.length;
-        // 모두 준비됐는지 (접속 중인 플레이어만 체크, 최소 2명)
-        const allReady = activeCount >= 2 && activePlayers.every((p, i) => {
-          const idx = room.players.indexOf(p);
-          return room.ready[idx] && room.chars[idx];
-        });
-        if (allReady) {
-          room.ready = Array(room.maxPlayers).fill(false);
-          const spawnXs = [W * 0.2, W * 0.8, W * 0.4, W * 0.6];
-          const spawnFacings = [1, -1, 1, -1];
-          room.game_players = [];
-          for (let i = 0; i < room.maxPlayers; i++) {
-            if (room.players[i] && room.players[i].readyState === 1 && room.chars[i]) {
-              room.game_players[i] = makePlayer(room.chars[i], spawnXs[i], spawnFacings[i]);
-            } else {
-              room.game_players[i] = null;
-            }
-          }
-          room.activePlayerCount = activeCount;
-          broadcastAll(room, { type: 'game_start', chars: room.chars, skins: room.skins, playerCount: activeCount });
-          startGame(room);
-        }
-        break;
-      }
-      case 'input': {
-        const room = rooms.get(ws._roomCode);
-        if (!room || !room.g) break;
-        const p = room.g.p[ws._playerIdx];
-        if (p) {
-          p.input.left = !!msg.l; p.input.right = !!msg.r; p.input.jump = !!msg.j;
-          p.input.attack = !!msg.a; p.input.mouseX = msg.mx || 0; p.input.mouseY = msg.my || 0;
-        }
-        break;
-      }
-      case 'ping': { sendTo(ws, { type: 'pong', t: msg.t }); break; }
-      case 'leave_room': {
-        removePlayer(ws); ws._roomCode = null; ws._playerIdx = -1;
-        sendTo(ws, { type: 'left_room' }); break;
-      }
+    if (msg.t === 'create') {
+      const code = genCode();
+      const room = {
+        code,
+        maxPlayers: Math.min(4, Math.max(2, msg.max || 2)),
+        players: [{ ws, char: msg.char || 'human', skin: msg.skin || 'default', idx: 0 }],
+        state: 'waiting'
+      };
+      rooms.set(code, room);
+      myRoom = room; myIdx = 0;
+      ws.send(JSON.stringify({ t:'room_ok', code, idx:0, max:room.maxPlayers,
+        players:[{idx:0, char:msg.char||'human', skin:msg.skin||'default'}] }));
+    }
+
+    else if (msg.t === 'join') {
+      const room = rooms.get(msg.code);
+      if (!room) { ws.send(JSON.stringify({ t:'err', reason:'방을 찾을 수 없습니다' })); return; }
+      if (room.state === 'playing') { ws.send(JSON.stringify({ t:'err', reason:'이미 게임 중입니다' })); return; }
+      if (room.players.length >= room.maxPlayers) { ws.send(JSON.stringify({ t:'err', reason:'방이 꽉 찼습니다' })); return; }
+      const idx = room.players.length;
+      room.players.push({ ws, char: msg.char||'human', skin: msg.skin||'default', idx });
+      myRoom = room; myIdx = idx;
+      ws.send(JSON.stringify({ t:'joined', idx, code:room.code, max:room.maxPlayers,
+        players: room.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin})) }));
+      roomBroadcast(room, { t:'player_in', idx, char:msg.char||'human', skin:msg.skin||'default' }, idx);
+    }
+
+    else if (msg.t === 'char_update') {
+      if (!myRoom) return;
+      const p = myRoom.players.find(p=>p.idx===myIdx);
+      if (p) { p.char = msg.char; p.skin = msg.skin; }
+      roomBroadcast(myRoom, { t:'char_update', idx:myIdx, char:msg.char, skin:msg.skin }, myIdx);
+    }
+
+    else if (msg.t === 'start' || msg.t === 'rematch') {
+      if (!myRoom || myIdx !== 0 || myRoom.players.length < 2) return;
+      const seed = Math.floor(Math.random() * 99999999);
+      myRoom.state = 'playing';
+      roomBroadcast(myRoom, {
+        t: 'game_start', seed,
+        players: myRoom.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin}))
+      });
+    }
+
+    else if (msg.t === 'in') {
+      if (!myRoom || myIdx === 0) return;
+      const host = myRoom.players[0];
+      if (host && host.ws.readyState === WebSocket.OPEN)
+        host.ws.send(JSON.stringify({ ...msg, idx: myIdx }));
+    }
+
+    else if (msg.t === 'st') {
+      if (!myRoom || myIdx !== 0) return;
+      roomBroadcast(myRoom, msg, 0);
     }
   });
 
-  ws.on('close', () => removePlayer(ws));
-  ws.on('error', () => removePlayer(ws));
+  ws.on('close', () => {
+    if (!myRoom) return;
+    myRoom.players = myRoom.players.filter(p => p.idx !== myIdx);
+    if (myRoom.players.length === 0) { rooms.delete(myRoom.code); return; }
+    if (myIdx === 0) {
+      roomBroadcast(myRoom, { t:'host_left' });
+      rooms.delete(myRoom.code);
+    } else {
+      roomBroadcast(myRoom, { t:'player_out', idx: myIdx });
+      if (myRoom.state === 'playing') myRoom.state = 'waiting';
+    }
+  });
 });
 
-server.listen(PORT, () => { console.log(`Sky Climber authoritative server on port ${PORT}`); });
+console.log('Sky Climber WebSocket server running on :8080');
