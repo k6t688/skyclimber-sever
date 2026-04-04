@@ -30,13 +30,13 @@ wss.on('connection', ws => {
       const room = {
         code,
         maxPlayers: Math.min(4, Math.max(2, msg.max || 2)),
-        players: [{ ws, char: msg.char || 'human', skin: msg.skin || 'default', idx: 0 }],
+        players: [{ ws, char: msg.char || 'human', skin: msg.skin || 'default', idx: 0, ready: false }],
         state: 'waiting'
       };
       rooms.set(code, room);
       myRoom = room; myIdx = 0;
       ws.send(JSON.stringify({ t:'room_ok', code, idx:0, max:room.maxPlayers,
-        players:[{idx:0, char:msg.char||'human', skin:msg.skin||'default'}] }));
+        players:[{idx:0, char:msg.char||'human', skin:msg.skin||'default', ready:false}] }));
     }
 
     else if (msg.t === 'join') {
@@ -45,24 +45,38 @@ wss.on('connection', ws => {
       if (room.state === 'playing') { ws.send(JSON.stringify({ t:'err', reason:'이미 게임 중입니다' })); return; }
       if (room.players.length >= room.maxPlayers) { ws.send(JSON.stringify({ t:'err', reason:'방이 꽉 찼습니다' })); return; }
       const idx = room.players.length;
-      room.players.push({ ws, char: msg.char||'human', skin: msg.skin||'default', idx });
+      room.players.push({ ws, char: msg.char||'human', skin: msg.skin||'default', idx, ready: false });
       myRoom = room; myIdx = idx;
       ws.send(JSON.stringify({ t:'joined', idx, code:room.code, max:room.maxPlayers,
-        players: room.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin})) }));
-      roomBroadcast(room, { t:'player_in', idx, char:msg.char||'human', skin:msg.skin||'default' }, idx);
+        players: room.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin, ready:p.ready})) }));
+      roomBroadcast(room, { t:'player_in', idx, char:msg.char||'human', skin:msg.skin||'default', ready:false }, idx);
     }
 
     else if (msg.t === 'char_update') {
       if (!myRoom) return;
       const p = myRoom.players.find(p=>p.idx===myIdx);
-      if (p) { p.char = msg.char; p.skin = msg.skin; }
+      if (p) { p.char = msg.char; p.skin = msg.skin; p.ready = false; }
       roomBroadcast(myRoom, { t:'char_update', idx:myIdx, char:msg.char, skin:msg.skin }, myIdx);
+      // 캐릭터 변경 시 준비 해제도 함께 전송
+      roomBroadcast(myRoom, { t:'ready', idx:myIdx, ready:false }, myIdx);
+    }
+
+    else if (msg.t === 'ready') {
+      if (!myRoom) return;
+      const p = myRoom.players.find(p=>p.idx===myIdx);
+      if (p) { p.ready = !!msg.ready; }
+      roomBroadcast(myRoom, { t:'ready', idx:myIdx, ready:!!msg.ready });
     }
 
     else if (msg.t === 'start' || msg.t === 'rematch') {
       if (!myRoom || myIdx !== 0 || myRoom.players.length < 2) return;
+      // 모든 플레이어가 준비 상태인지 확인
+      const allReady = myRoom.players.every(p => p.ready);
+      if (!allReady) return;
       const seed = Math.floor(Math.random() * 99999999);
       myRoom.state = 'playing';
+      // 준비 상태 초기화
+      for (const p of myRoom.players) p.ready = false;
       roomBroadcast(myRoom, {
         t: 'game_start', seed,
         players: myRoom.players.map(p=>({idx:p.idx, char:p.char, skin:p.skin}))
