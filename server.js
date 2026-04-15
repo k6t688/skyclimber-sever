@@ -8,17 +8,18 @@ const rooms = new Map();
 
 // ─── 영속 계층 (db.json) ──────────────────────────────
 const DB_PATH = path.join(__dirname, 'db.json');
-let DB = { users: {} };
+let DB = { users: {}, sessions: {} };
 try {
   if (fs.existsSync(DB_PATH)) {
     DB = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
     if (!DB.users) DB.users = {};
+    if (!DB.sessions) DB.sessions = {};
   } else {
     fs.writeFileSync(DB_PATH, JSON.stringify(DB));
   }
 } catch (e) {
   console.error('DB load error:', e);
-  DB = { users: {} };
+  DB = { users: {}, sessions: {} };
 }
 
 let saveTimer = null;
@@ -27,6 +28,7 @@ function saveDB() {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
+      DB.sessions = Object.fromEntries(sessions);
       fs.writeFileSync(DB_PATH + '.tmp', JSON.stringify(DB));
       fs.renameSync(DB_PATH + '.tmp', DB_PATH);
     } catch (e) { console.error('DB save error:', e); }
@@ -47,6 +49,8 @@ function verifyPw(pw, salt, hash) {
 function newToken() { return crypto.randomBytes(24).toString('hex'); }
 
 const sessions = new Map(); // token -> username
+// db.json의 sessions 복원 (재시작 후에도 로그인 토큰 유지)
+for (const [t, u] of Object.entries(DB.sessions || {})) sessions.set(t, u);
 
 function userUnlocks(u) {
   return {
@@ -119,9 +123,9 @@ wss.on('connection', (ws, req) => {
         createdAt: now, updatedAt: now
       };
       DB.users[user] = rec;
-      saveDB();
       const token = newToken();
       sessions.set(token, user);
+      saveDB();
       ws.send(JSON.stringify({ t:'auth_ok', user, token, unlocks: userUnlocks(rec) }));
       return;
     }
@@ -136,6 +140,7 @@ wss.on('connection', (ws, req) => {
       if (!verifyPw(pw, rec.salt, rec.hash)) { ws.send(JSON.stringify({ t:'auth_err', code:'invalid' })); return; }
       const token = newToken();
       sessions.set(token, user);
+      saveDB();
       ws.send(JSON.stringify({ t:'auth_ok', user, token, unlocks: userUnlocks(rec) }));
       return;
     }
