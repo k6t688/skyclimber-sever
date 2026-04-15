@@ -111,12 +111,11 @@ wss.on('connection', (ws, req) => {
       const salt = newSalt();
       const hash = hashPw(pw, salt);
       const now = Date.now();
-      const incoming = msg.unlocks || {};
       const rec = {
         salt, hash,
-        charsUnlocked: Array.from(new Set(['human', ...(incoming.charsUnlocked || [])])),
-        skinsUnlocked: Array.from(new Set(incoming.skinsUnlocked || [])),
-        stagesCleared: Array.from(new Set(incoming.stagesCleared || [])),
+        charsUnlocked: ['human'],
+        skinsUnlocked: [],
+        stagesCleared: [],
         createdAt: now, updatedAt: now
       };
       DB.users[user] = rec;
