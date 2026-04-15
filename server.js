@@ -1,6 +1,81 @@
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
 const wss = new WebSocket.Server({ port: 8080 });
 const rooms = new Map();
+
+// ─── 영속 계층 (db.json) ──────────────────────────────
+const DB_PATH = path.join(__dirname, 'db.json');
+let DB = { users: {} };
+try {
+  if (fs.existsSync(DB_PATH)) {
+    DB = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    if (!DB.users) DB.users = {};
+  } else {
+    fs.writeFileSync(DB_PATH, JSON.stringify(DB));
+  }
+} catch (e) {
+  console.error('DB load error:', e);
+  DB = { users: {} };
+}
+
+let saveTimer = null;
+function saveDB() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.writeFileSync(DB_PATH + '.tmp', JSON.stringify(DB));
+      fs.renameSync(DB_PATH + '.tmp', DB_PATH);
+    } catch (e) { console.error('DB save error:', e); }
+  }, 300);
+}
+
+// ─── 인증 유틸 ────────────────────────────────────────
+const USER_RE = /^[a-zA-Z0-9_가-힣]{2,16}$/;
+function validUser(u) { return typeof u === 'string' && USER_RE.test(u); }
+function validPw(p)   { return typeof p === 'string' && p.length >= 4 && p.length <= 64; }
+function newSalt()    { return crypto.randomBytes(16).toString('hex'); }
+function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 64).toString('hex'); }
+function verifyPw(pw, salt, hash) {
+  const h = hashPw(pw, salt);
+  const a = Buffer.from(h, 'hex'), b = Buffer.from(hash, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function newToken() { return crypto.randomBytes(24).toString('hex'); }
+
+const sessions = new Map(); // token -> username
+
+function userUnlocks(u) {
+  return {
+    charsUnlocked: u.charsUnlocked || ['human'],
+    skinsUnlocked: u.skinsUnlocked || [],
+    stagesCleared: u.stagesCleared || []
+  };
+}
+function mergeUnlocks(target, incoming) {
+  if (!incoming) return;
+  const uniq = (a, b) => {
+    const s = new Set(a || []);
+    for (const x of (b || [])) s.add(x);
+    return Array.from(s);
+  };
+  target.charsUnlocked = uniq(target.charsUnlocked, incoming.charsUnlocked);
+  target.skinsUnlocked = uniq(target.skinsUnlocked, incoming.skinsUnlocked);
+  target.stagesCleared = uniq(target.stagesCleared, incoming.stagesCleared);
+}
+
+// ─── 로그인 레이트 리밋 (IP 기준) ─────────────────────
+const rlMap = new Map(); // ip -> {count, resetAt}
+function rlCheck(ip) {
+  const now = Date.now();
+  let r = rlMap.get(ip);
+  if (!r || r.resetAt < now) { r = { count: 0, resetAt: now + 1000 }; rlMap.set(ip, r); }
+  r.count++;
+  return r.count <= 15;
+}
 
 function genCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -18,14 +93,68 @@ function roomBroadcast(room, msg, excludeIdx=-1) {
   }
 }
 
-wss.on('connection', ws => {
+wss.on('connection', (ws, req) => {
   let myRoom = null;
   let myIdx = -1;
+  const ip = (req && req.socket && req.socket.remoteAddress) || 'unknown';
 
   ws.on('message', raw => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
 
-    if (msg.t === 'create') {
+    // ─── 인증: 회원가입 ──────────────────────────────
+    if (msg.t === 'auth_register') {
+      if (!rlCheck(ip)) { ws.send(JSON.stringify({ t:'auth_err', code:'rate_limit' })); return; }
+      const { user, pw } = msg;
+      if (!validUser(user)) { ws.send(JSON.stringify({ t:'auth_err', code:'bad_user' })); return; }
+      if (!validPw(pw))     { ws.send(JSON.stringify({ t:'auth_err', code:'bad_pw' })); return; }
+      if (DB.users[user])   { ws.send(JSON.stringify({ t:'auth_err', code:'exists' })); return; }
+      const salt = newSalt();
+      const hash = hashPw(pw, salt);
+      const now = Date.now();
+      const incoming = msg.unlocks || {};
+      const rec = {
+        salt, hash,
+        charsUnlocked: Array.from(new Set(['human', ...(incoming.charsUnlocked || [])])),
+        skinsUnlocked: Array.from(new Set(incoming.skinsUnlocked || [])),
+        stagesCleared: Array.from(new Set(incoming.stagesCleared || [])),
+        createdAt: now, updatedAt: now
+      };
+      DB.users[user] = rec;
+      saveDB();
+      const token = newToken();
+      sessions.set(token, user);
+      ws.send(JSON.stringify({ t:'auth_ok', user, token, unlocks: userUnlocks(rec) }));
+      return;
+    }
+
+    // ─── 인증: 로그인 ────────────────────────────────
+    else if (msg.t === 'auth_login') {
+      if (!rlCheck(ip)) { ws.send(JSON.stringify({ t:'auth_err', code:'rate_limit' })); return; }
+      const { user, pw } = msg;
+      if (!validUser(user) || !validPw(pw)) { ws.send(JSON.stringify({ t:'auth_err', code:'invalid' })); return; }
+      const rec = DB.users[user];
+      if (!rec)                        { ws.send(JSON.stringify({ t:'auth_err', code:'invalid' })); return; }
+      if (!verifyPw(pw, rec.salt, rec.hash)) { ws.send(JSON.stringify({ t:'auth_err', code:'invalid' })); return; }
+      const token = newToken();
+      sessions.set(token, user);
+      ws.send(JSON.stringify({ t:'auth_ok', user, token, unlocks: userUnlocks(rec) }));
+      return;
+    }
+
+    // ─── 해금 동기화 (union 병합) ────────────────────
+    else if (msg.t === 'save_sync') {
+      const { token, unlocks } = msg;
+      const user = sessions.get(token);
+      if (!user || !DB.users[user]) { ws.send(JSON.stringify({ t:'save_err', code:'unauth' })); return; }
+      const rec = DB.users[user];
+      mergeUnlocks(rec, unlocks);
+      rec.updatedAt = Date.now();
+      saveDB();
+      ws.send(JSON.stringify({ t:'save_ok', unlocks: userUnlocks(rec) }));
+      return;
+    }
+
+    else if (msg.t === 'create') {
       const code = genCode();
       const room = {
         code,
