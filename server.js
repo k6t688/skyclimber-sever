@@ -81,6 +81,48 @@ function rlCheck(ip) {
   return r.count <= 15;
 }
 
+// ─── 관리자 토큰 로드 ─────────────────────────────────
+// 우선순위: 환경변수 ADMIN_TOKEN > 파일 admin_token.txt
+// 둘 다 없으면 관리자 기능 비활성화
+const ADMIN_TOKEN_PATH = path.join(__dirname, 'admin_token.txt');
+let ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+if (!ADMIN_TOKEN) {
+  try {
+    if (fs.existsSync(ADMIN_TOKEN_PATH)) {
+      ADMIN_TOKEN = fs.readFileSync(ADMIN_TOKEN_PATH, 'utf8').trim() || null;
+    }
+  } catch (e) { /* ignore */ }
+}
+if (ADMIN_TOKEN) {
+  console.log('[ADMIN] 관리자 기능 활성화됨');
+} else {
+  console.log('[ADMIN] 관리자 토큰 없음 → 관리자 기능 비활성화');
+}
+// 관리자 요청 레이트 리밋 (IP 기준, 실패만 카운트)
+const adminRlMap = new Map();
+function adminRlCheck(ip) {
+  const now = Date.now();
+  let r = adminRlMap.get(ip);
+  if (!r || r.resetAt < now) { r = { count: 0, resetAt: now + 60000 }; adminRlMap.set(ip, r); }
+  return r.count < 10;
+}
+function adminRlFail(ip) {
+  const now = Date.now();
+  let r = adminRlMap.get(ip);
+  if (!r || r.resetAt < now) { r = { count: 0, resetAt: now + 60000 }; adminRlMap.set(ip, r); }
+  r.count++;
+}
+function adminAuth(ip, token) {
+  if (!ADMIN_TOKEN) return false;
+  if (!adminRlCheck(ip)) return false;
+  const a = Buffer.from(String(token || ''));
+  const b = Buffer.from(ADMIN_TOKEN);
+  if (a.length !== b.length) { adminRlFail(ip); return false; }
+  const ok = crypto.timingSafeEqual(a, b);
+  if (!ok) adminRlFail(ip);
+  return ok;
+}
+
 function genCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code;
@@ -155,6 +197,69 @@ wss.on('connection', (ws, req) => {
       rec.updatedAt = Date.now();
       saveDB();
       ws.send(JSON.stringify({ t:'save_ok', unlocks: userUnlocks(rec) }));
+      return;
+    }
+
+    // ─── 관리자 명령 ─────────────────────────────────
+    else if (msg.t && msg.t.startsWith('admin_')) {
+      if (!adminAuth(ip, msg.token)) {
+        ws.send(JSON.stringify({ t:'admin_err', code:'bad_token' })); return;
+      }
+      if (msg.t === 'admin_list') {
+        const users = Object.entries(DB.users).map(([name, u]) => ({
+          user: name,
+          charsUnlocked: u.charsUnlocked || [],
+          skinsUnlocked: u.skinsUnlocked || [],
+          stagesCleared: u.stagesCleared || [],
+          createdAt: u.createdAt || 0,
+          updatedAt: u.updatedAt || 0
+        }));
+        ws.send(JSON.stringify({ t:'admin_list_ok', users }));
+        return;
+      }
+      if (msg.t === 'admin_set') {
+        const { user, unlocks } = msg;
+        if (!user || !DB.users[user] || !unlocks) {
+          ws.send(JSON.stringify({ t:'admin_err', code:'no_user' })); return;
+        }
+        const rec = DB.users[user];
+        if (Array.isArray(unlocks.charsUnlocked)) rec.charsUnlocked = unlocks.charsUnlocked.slice();
+        if (Array.isArray(unlocks.skinsUnlocked)) rec.skinsUnlocked = unlocks.skinsUnlocked.slice();
+        if (Array.isArray(unlocks.stagesCleared)) rec.stagesCleared = unlocks.stagesCleared.map(Number).filter(n=>!isNaN(n));
+        rec.updatedAt = Date.now();
+        saveDB();
+        ws.send(JSON.stringify({ t:'admin_ok', user, unlocks: userUnlocks(rec) }));
+        return;
+      }
+      if (msg.t === 'admin_reset') {
+        const { user } = msg;
+        if (!user || !DB.users[user]) {
+          ws.send(JSON.stringify({ t:'admin_err', code:'no_user' })); return;
+        }
+        const rec = DB.users[user];
+        rec.charsUnlocked = ['human'];
+        rec.skinsUnlocked = [];
+        rec.stagesCleared = [];
+        rec.updatedAt = Date.now();
+        saveDB();
+        ws.send(JSON.stringify({ t:'admin_ok', user, unlocks: userUnlocks(rec) }));
+        return;
+      }
+      if (msg.t === 'admin_delete') {
+        const { user } = msg;
+        if (!user || !DB.users[user]) {
+          ws.send(JSON.stringify({ t:'admin_err', code:'no_user' })); return;
+        }
+        delete DB.users[user];
+        // 해당 유저의 세션 토큰도 제거
+        for (const [t, u] of sessions.entries()) {
+          if (u === user) sessions.delete(t);
+        }
+        saveDB();
+        ws.send(JSON.stringify({ t:'admin_deleted', user }));
+        return;
+      }
+      ws.send(JSON.stringify({ t:'admin_err', code:'unknown' }));
       return;
     }
 
